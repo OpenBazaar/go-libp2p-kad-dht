@@ -64,6 +64,10 @@ type IpfsDHT struct {
 	plk sync.Mutex
 
 	protocols []protocol.ID // DHT protocols
+
+	// OpenBazaar: this chan is added which is closed when the bootstrap finished
+	// this is used to flag ob-go that the DHT is ready for use.
+	BootstrapChan chan struct{}
 }
 
 // New creates a new DHT with the specified host and options.

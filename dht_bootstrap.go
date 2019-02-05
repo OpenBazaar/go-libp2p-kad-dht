@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"sync"
 	"time"
 
 	u "github.com/ipfs/go-ipfs-util"
@@ -124,6 +125,10 @@ func (dht *IpfsDHT) bootstrapWorker(cfg BootstrapConfig) func(worker goprocess.P
 	}
 }
 
+// OpenBazaar: this once is used to guard the closing of the bootstrap chan so that
+// it is only closed after the first bootstrap round completes.
+var bootstrapOnce sync.Once
+
 // runBootstrap builds up list of peers by requesting random peer IDs
 func (dht *IpfsDHT) runBootstrap(ctx context.Context, cfg BootstrapConfig) error {
 	bslog := func(msg string) {
@@ -179,5 +184,11 @@ func (dht *IpfsDHT) runBootstrap(ctx context.Context, cfg BootstrapConfig) error
 	if len(merr) > 0 {
 		return merr
 	}
+
+	// OpenBazaar: close the bootstrap chan when the first round completes.
+	bootstrapOnce.Do(func(){
+		close(dht.BootstrapChan)
+	})
+
 	return nil
 }
