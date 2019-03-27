@@ -31,7 +31,7 @@ import (
 	base32 "github.com/whyrusleeping/base32"
 )
 
-var log = logging.Logger("dht")
+var logger = logging.Logger("dht")
 
 // NumBootstrapQueries defines the number of random dht queries to do to
 // collect members of the routing table.
@@ -68,6 +68,16 @@ type IpfsDHT struct {
 	BootstrapChan chan struct{}
 }
 
+// Assert that IPFS assumptions about interfaces aren't broken. These aren't a
+// guarantee, but we can use them to aid refactoring.
+var (
+	_ routing.ContentRouting = (*IpfsDHT)(nil)
+	_ routing.IpfsRouting    = (*IpfsDHT)(nil)
+	_ routing.PeerRouting    = (*IpfsDHT)(nil)
+	_ routing.PubKeyFetcher  = (*IpfsDHT)(nil)
+	_ routing.ValueStore     = (*IpfsDHT)(nil)
+)
+
 // New creates a new DHT with the specified host and options.
 func New(ctx context.Context, h host.Host, options ...opts.Option) (*IpfsDHT, error) {
 	var cfg opts.Options
@@ -87,6 +97,7 @@ func New(ctx context.Context, h host.Host, options ...opts.Option) (*IpfsDHT, er
 
 	dht.proc.AddChild(dht.providers.Process())
 	dht.Validator = cfg.Validator
+	dht.BootstrapChan = make(chan struct{})
 
 	if !cfg.Client {
 		for _, p := range cfg.Protocols {
@@ -151,12 +162,12 @@ func (dht *IpfsDHT) putValueToPeer(ctx context.Context, p peer.ID, rec *recpb.Re
 	pmes.Record = rec
 	rpmes, err := dht.sendRequest(ctx, p, pmes)
 	if err != nil {
-		log.Debugf("putValueToPeer: %v. (peer: %s, key: %s)", err, p.Pretty(), loggableKey(string(rec.Key)))
+		logger.Debugf("putValueToPeer: %v. (peer: %s, key: %s)", err, p.Pretty(), loggableKey(string(rec.Key)))
 		return err
 	}
 
 	if !bytes.Equal(rpmes.GetRecord().Value, pmes.GetRecord().Value) {
-		log.Warningf("putValueToPeer: value not put correctly. (%v != %v)", pmes, rpmes)
+		logger.Warningf("putValueToPeer: value not put correctly. (%v != %v)", pmes, rpmes)
 		return errors.New("value not put correctly")
 	}
 
@@ -181,12 +192,12 @@ func (dht *IpfsDHT) getValueOrPeers(ctx context.Context, p peer.ID, key string) 
 
 	if record := pmes.GetRecord(); record != nil {
 		// Success! We were given the value
-		log.Debug("getValueOrPeers: got value")
+		logger.Debug("getValueOrPeers: got value")
 
 		// make sure record is valid.
 		err = dht.Validator.Validate(string(record.GetKey()), record.GetValue())
 		if err != nil {
-			log.Info("Received invalid record! (discarded)")
+			logger.Info("Received invalid record! (discarded)")
 			// return a sentinal to signify an invalid record was received
 			err = errInvalidRecord
 			record = new(recpb.Record)
@@ -195,11 +206,11 @@ func (dht *IpfsDHT) getValueOrPeers(ctx context.Context, p peer.ID, key string) 
 	}
 
 	if len(peers) > 0 {
-		log.Debug("getValueOrPeers: peers")
+		logger.Debug("getValueOrPeers: peers")
 		return nil, peers, nil
 	}
 
-	log.Warning("getValueOrPeers: routing.ErrNotFound")
+	logger.Warning("getValueOrPeers: routing.ErrNotFound")
 	return nil, nil, routing.ErrNotFound
 }
 
@@ -210,7 +221,7 @@ func (dht *IpfsDHT) getValueSingle(ctx context.Context, p peer.ID, key string) (
 		"peer": p,
 	}
 
-	eip := log.EventBegin(ctx, "getValueSingle", meta)
+	eip := logger.EventBegin(ctx, "getValueSingle", meta)
 	defer eip.Done()
 
 	pmes := pb.NewMessage(pb.Message_GET_VALUE, []byte(key), 0)
@@ -219,7 +230,7 @@ func (dht *IpfsDHT) getValueSingle(ctx context.Context, p peer.ID, key string) (
 	case nil:
 		return resp, nil
 	case ErrReadTimeout:
-		log.Warningf("getValueSingle: read timeout %s %s", p.Pretty(), key)
+		logger.Warningf("getValueSingle: read timeout %s %s", p.Pretty(), key)
 		fallthrough
 	default:
 		eip.SetError(err)
@@ -229,16 +240,16 @@ func (dht *IpfsDHT) getValueSingle(ctx context.Context, p peer.ID, key string) (
 
 // getLocal attempts to retrieve the value from the datastore
 func (dht *IpfsDHT) getLocal(key string) (*recpb.Record, error) {
-	log.Debugf("getLocal %s", key)
+	logger.Debugf("getLocal %s", key)
 	rec, err := dht.getRecordFromDatastore(mkDsKey(key))
 	if err != nil {
-		log.Warningf("getLocal: %s", err)
+		logger.Warningf("getLocal: %s", err)
 		return nil, err
 	}
 
 	// Double check the key. Can't hurt.
 	if rec != nil && string(rec.GetKey()) != key {
-		log.Errorf("BUG getLocal: found a DHT record that didn't match it's key: %s != %s", rec.GetKey(), key)
+		logger.Errorf("BUG getLocal: found a DHT record that didn't match it's key: %s != %s", rec.GetKey(), key)
 		return nil, nil
 
 	}
@@ -250,7 +261,7 @@ func (dht *IpfsDHT) getLocal(key string) (*recpb.Record, error) {
 func (dht *IpfsDHT) getOwnPrivateKey() (ci.PrivKey, error) {
 	sk := dht.peerstore.PrivKey(dht.self)
 	if sk == nil {
-		log.Warningf("%s dht cannot get own private key!", dht.self)
+		logger.Warningf("%s dht cannot get own private key!", dht.self)
 		return nil, fmt.Errorf("cannot get private key to sign record!")
 	}
 	return sk, nil
@@ -258,10 +269,10 @@ func (dht *IpfsDHT) getOwnPrivateKey() (ci.PrivKey, error) {
 
 // putLocal stores the key value pair in the datastore
 func (dht *IpfsDHT) putLocal(key string, rec *recpb.Record) error {
-	log.Debugf("putLocal: %v %v", key, rec)
+	logger.Debugf("putLocal: %v %v", key, rec)
 	data, err := proto.Marshal(rec)
 	if err != nil {
-		log.Warningf("putLocal: %s", err)
+		logger.Warningf("putLocal: %s", err)
 		return err
 	}
 
@@ -271,7 +282,7 @@ func (dht *IpfsDHT) putLocal(key string, rec *recpb.Record) error {
 // Update signals the routingTable to Update its last-seen status
 // on the given peer.
 func (dht *IpfsDHT) Update(ctx context.Context, p peer.ID) {
-	log.Event(ctx, "updatePeer", p)
+	logger.Event(ctx, "updatePeer", p)
 	dht.routingTable.Update(p)
 }
 
@@ -287,7 +298,7 @@ func (dht *IpfsDHT) FindLocal(id peer.ID) pstore.PeerInfo {
 
 // findPeerSingle asks peer 'p' if they know where the peer with id 'id' is
 func (dht *IpfsDHT) findPeerSingle(ctx context.Context, p peer.ID, id peer.ID) (*pb.Message, error) {
-	eip := log.EventBegin(ctx, "findPeerSingle",
+	eip := logger.EventBegin(ctx, "findPeerSingle",
 		logging.LoggableMap{
 			"peer":   p,
 			"target": id,
@@ -300,7 +311,7 @@ func (dht *IpfsDHT) findPeerSingle(ctx context.Context, p peer.ID, id peer.ID) (
 	case nil:
 		return resp, nil
 	case ErrReadTimeout:
-		log.Warningf("read timeout: %s %s", p.Pretty(), id)
+		logger.Warningf("read timeout: %s %s", p.Pretty(), id)
 		fallthrough
 	default:
 		eip.SetError(err)
@@ -309,7 +320,7 @@ func (dht *IpfsDHT) findPeerSingle(ctx context.Context, p peer.ID, id peer.ID) (
 }
 
 func (dht *IpfsDHT) findProvidersSingle(ctx context.Context, p peer.ID, key cid.Cid) (*pb.Message, error) {
-	eip := log.EventBegin(ctx, "findProvidersSingle", p, key)
+	eip := logger.EventBegin(ctx, "findProvidersSingle", p, key)
 	defer eip.Done()
 
 	pmes := pb.NewMessage(pb.Message_GET_PROVIDERS, key.Bytes(), 0)
@@ -318,7 +329,7 @@ func (dht *IpfsDHT) findProvidersSingle(ctx context.Context, p peer.ID, key cid.
 	case nil:
 		return resp, nil
 	case ErrReadTimeout:
-		log.Warningf("read timeout: %s %s", p.Pretty(), key)
+		logger.Warningf("read timeout: %s %s", p.Pretty(), key)
 		fallthrough
 	default:
 		eip.SetError(err)
@@ -338,7 +349,7 @@ func (dht *IpfsDHT) betterPeersToQuery(pmes *pb.Message, p peer.ID, count int) [
 
 	// no node? nil
 	if closer == nil {
-		log.Warning("betterPeersToQuery: no closer peers to send:", p)
+		logger.Warning("betterPeersToQuery: no closer peers to send:", p)
 		return nil
 	}
 
@@ -347,7 +358,7 @@ func (dht *IpfsDHT) betterPeersToQuery(pmes *pb.Message, p peer.ID, count int) [
 
 		// == to self? thats bad
 		if clp == dht.self {
-			log.Error("BUG betterPeersToQuery: attempted to return self! this shouldn't happen...")
+			logger.Error("BUG betterPeersToQuery: attempted to return self! this shouldn't happen...")
 			return nil
 		}
 		// Dont send a peer back themselves
